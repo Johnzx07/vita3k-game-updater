@@ -2,9 +2,13 @@
 
 **A polished Windows game update companion for Vita3K.** Vita Pulse scans the games already installed in your Vita3K library, checks Sony's official PS Vita update feed, and downloads update packages with size and SHA-1 verification. Its package inspector keeps each game's releases together.
 
-![Vita Pulse logo](assets/vita-pulse.svg)
+<p align="center"><img src="assets/vita-pulse.png" width="260" alt="V3K logo"></p>
 
 ![Interface preview with sample title](docs/images/interface-preview.png)
+
+## Download for Windows
+
+Get **`vita-pulse.exe`** and **`SHA256SUMS.txt`** from the [latest release](https://github.com/Johnzx07/vita3k-game-updater/releases/latest). The executable includes the V3K icon and does not require Python. Open it, choose your Vita3K content folder if needed, and select **Check all updates**.
 
 ## What it does
 
@@ -41,7 +45,9 @@ python -m PyInstaller --noconfirm --clean vita-pulse.spec
 dist\vita-pulse.exe --smoke-test
 ```
 
-The bundled executable is `dist/vita-pulse.exe`. The build script creates `assets/vita-pulse.ico` from the original Vita Pulse mark and embeds it in the executable. GitHub Actions also builds an executable on every push and publishes it for version tags.
+The bundled executable is `dist/vita-pulse.exe`. The build script converts the owner's V3K artwork in `assets/v3k-logo-source.png` into the app image and a multi-resolution `.ico` embedded in the executable. GitHub Actions builds on Python 3.12, runs a packaged startup check, and publishes verified builds for version tags.
+
+If an older local executable displays a `QtCore` DLL load error, replace it with the latest release executable. The previous local build made with Python 3.14 had this problem; the release builds use Python 3.12 and are checked for successful startup before publication.
 
 ## Source and security
 

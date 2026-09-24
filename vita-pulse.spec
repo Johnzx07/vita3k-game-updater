@@ -8,7 +8,7 @@ a = Analysis(
     [str(root / "main.py")],
     pathex=[str(root)],
     binaries=[],
-    datas=[(str(assets / "vita-pulse.svg"), "assets")],
+    datas=[(str(assets / "vita-pulse.png"), "assets")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -28,4 +28,3 @@ exe = EXE(
     console=False,
     icon=str(assets / "vita-pulse.ico"),
 )
-
