@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+build/
+dist/
+*.spec.bak
+*.part
+
+
+ui-preview.png
+ui-sample.png
