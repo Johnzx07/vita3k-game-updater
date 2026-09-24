@@ -23,10 +23,10 @@ Vita3K's [FAQ](https://vita3k.org/faq) documents package installation, and its [
 
 ## Run from source
 
-Requires Windows and Python 3.11 or newer.
+Requires Windows. Use Python 3.12 in a clean virtual environment for building the executable; this matches the verified GitHub Actions build.
 
 ```powershell
-py -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python main.py
@@ -38,6 +38,7 @@ python main.py
 python -m pip install Pillow pyinstaller
 python tools/build_icon.py
 python -m PyInstaller --noconfirm --clean vita-pulse.spec
+dist\vita-pulse.exe --smoke-test
 ```
 
 The bundled executable is `dist/vita-pulse.exe`. The build script creates `assets/vita-pulse.ico` from the original Vita Pulse mark and embeds it in the executable. GitHub Actions also builds an executable on every push and publishes it for version tags.

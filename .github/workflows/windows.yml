@@ -24,6 +24,18 @@ jobs:
         run: |
           python tools/build_icon.py
           python -m PyInstaller --noconfirm --clean vita-pulse.spec
+      - name: Smoke test packaged executable
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $process = Start-Process -FilePath (Resolve-Path 'dist/vita-pulse.exe') -ArgumentList '--smoke-test' -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(45000)) {
+            Stop-Process -Id $process.Id -Force
+            throw 'Packaged executable did not complete its startup check.'
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged executable startup failed with exit code $($process.ExitCode)."
+          }
       - name: Hash executable
         shell: pwsh
         run: |
@@ -40,4 +52,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${{ github.ref_name }}" dist/vita-pulse.exe dist/SHA256SUMS.txt --generate-notes
-
