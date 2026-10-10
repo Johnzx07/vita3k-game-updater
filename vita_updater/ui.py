@@ -29,7 +29,7 @@ def human_size(size: int) -> str:
 
 class Worker(QObject):
     checked = Signal(str, str, object)
-    downloaded = Signal(str, str)
+    downloaded = Signal(str, str, bool)
     progress = Signal(str, int, int)
     error = Signal(str, str)
     art_ready = Signal(str, object)
@@ -68,11 +68,11 @@ class Worker(QObject):
             elif self.mode == "download" and self.destination:
                 for update in self.updates:
                     try:
-                        path = download_update(
+                        result = download_update(
                             update, self.title_id, self.destination,
                             lambda done, total: self.progress.emit(self.title_id, done, total),
                         )
-                        self.downloaded.emit(self.title_id, str(path))
+                        self.downloaded.emit(self.title_id, result.sha1, result.verified)
                     except Exception as exc:
                         self.error.emit(self.title_id, f"v{update.version}: {exc}")
                         break
@@ -485,9 +485,17 @@ class MainWindow(QMainWindow):
         else:
             self.populate_list()
 
-    def _on_downloaded(self, title_id: str, path: str):
-        self.activity.setText(f"Verified {Path(path).name}")
-        self.progress_text.setText("Verified against Sony's SHA-1 metadata")
+    def _on_downloaded(self, title_id: str, sha1: str, verified: bool):
+        if verified:
+            self.activity.setText(f"Verified {title_id} against Sony's SHA-1")
+            self.progress_text.setText("Verified against Sony's SHA-1 metadata")
+        else:
+            self.activity.setText(f"Saved {title_id} — kept, SHA-1 did not match Sony metadata")
+            self.progress_text.setText(
+                f"Saved without verification (file hash {sha1[:12]}…). Sony's metadata reported a different "
+                "SHA-1, which can describe an older revision of the same package. The file is kept so you "
+                "can still install it in Vita3K."
+            )
 
     def _on_progress(self, title_id: str, done: int, total: int):
         self.progress_bar.show()

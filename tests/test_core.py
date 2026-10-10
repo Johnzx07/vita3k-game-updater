@@ -8,8 +8,10 @@ from pathlib import Path
 from PIL import Image
 
 from vita_updater.core import (
+    IncompleteDownload,
     Update,
     _safe_icon_url,
+    download_update,
     find_game_art,
     find_library_root,
     parse_updates,
@@ -19,6 +21,38 @@ from vita_updater.core import (
     valid_icon_bytes,
     verify_package,
 )
+
+
+class StubResponse:
+    def __init__(self, body: bytes, content_length=None):
+        self.body = body
+        self.headers = {"Content-Length": str(content_length if content_length is not None else len(body))}
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=1024):
+        for start in range(0, len(self.body), chunk_size):
+            yield self.body[start:start + chunk_size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class StubSession:
+    """Returns bytes that hash differently from what the metadata claims —
+    reproducing the real PCSA00007 case where Sony's XML sha1sum describes an
+    older revision of the same .pkg path."""
+
+    def __init__(self, body: bytes, content_length=None):
+        self.body = body
+        self.content_length = content_length
+
+    def get(self, url, **_):
+        return StubResponse(self.body, self.content_length)
 
 
 def png_bytes(size: int = 8) -> bytes:
@@ -182,6 +216,74 @@ class CoreTests(unittest.TestCase):
             cache.mkdir()
             (cache / "PCSA00007.png").write_bytes(b"corrupted")
             self.assertIsNone(find_game_art(None, "PCSA00007", cache_dir=cache, allow_remote=False))
+
+    def test_mismatch_keeps_completed_download(self):
+        """Regression: Sony's XML can name a sha1sum for an older revision of the
+        same .pkg path. The file must be kept, not deleted, and reported unverified."""
+        with tempfile.TemporaryDirectory() as temp:
+            dest = Path(temp) / "dest"
+            served = b"actual bytes sony serves for that path"
+            claimed = "0" * 40
+            update = Update("01.01", len(served), claimed,
+                            "https://gs2-sec.ww.prod.dl.playstation.net/ppkg/np/PCSA00007/x/real.pkg",
+                            "cumulative", "PPSA00000_00-00000000000000")
+            result = download_update(update, "PCSA00007", dest, lambda d, t: None,
+                                     session=StubSession(served), attempts=1)
+            self.assertFalse(result.verified)
+            self.assertTrue(result.path.is_file(), "completed download must survive a metadata mismatch")
+            self.assertEqual(result.path.read_bytes(), served)
+            self.assertEqual(result.sha1, hashlib.sha1(served).hexdigest())
+            self.assertIn("SHA-1", result.note)
+
+    def test_strict_mode_still_rejects_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dest = Path(temp) / "dest"
+            served = b"some bytes"
+            update = Update("01.01", len(served), "0" * 40,
+                            "https://gs2-sec.ww.prod.dl.playstation.net/ppkg/np/PCSA00007/x/real.pkg",
+                            "cumulative", "")
+            with self.assertRaises(ValueError):
+                download_update(update, "PCSA00007", dest, lambda d, t: None,
+                                session=StubSession(served), strict=True, attempts=1)
+            self.assertFalse((dest / "PCSA00007" / "real.pkg").exists())
+
+    def test_verified_download_reports_verified(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dest = Path(temp) / "dest"
+            served = b"matching bytes"
+            update = Update("01.01", len(served), hashlib.sha1(served).hexdigest(),
+                            "https://gs2-sec.ww.prod.dl.playstation.net/ppkg/np/PCSA00007/x/ok.pkg",
+                            "cumulative", "")
+            result = download_update(update, "PCSA00007", dest, lambda d, t: None,
+                                     session=StubSession(served), attempts=1)
+            self.assertTrue(result.verified)
+            self.assertEqual(result.note, "")
+            self.assertTrue(verify_package(result.path, update))
+
+    def test_incomplete_download_is_discarded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dest = Path(temp) / "dest"
+            short = b"only half"
+            update = Update("01.01", 4000, hashlib.sha1(short).hexdigest(),
+                            "https://gs2-sec.ww.prod.dl.playstation.net/ppkg/np/PCSA00007/x/short.pkg",
+                            "cumulative", "")
+            # Sony reports 4000 bytes for this package; only 9 arrived -> truncated.
+            stub = StubSession(short, content_length=4000)
+            with self.assertRaises(IncompleteDownload):
+                download_update(update, "PCSA00007", dest, lambda d, t: None, session=stub, attempts=1)
+            self.assertFalse((dest / "PCSA00007" / "short.pkg").exists())
+
+    def test_retry_then_report_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dest = Path(temp) / "dest"
+            served = b"mismatched bytes"
+            update = Update("01.01", len(served), "1" * 40,
+                            "https://gs2-sec.ww.prod.dl.playstation.net/ppkg/np/PCSA00007/x/two.pkg",
+                            "cumulative", "")
+            result = download_update(update, "PCSA00007", dest, lambda d, t: None,
+                                     session=StubSession(served), attempts=2)
+            self.assertFalse(result.verified)
+            self.assertTrue(result.path.is_file())
 
     def test_sha1_and_size_verification(self):
         with tempfile.TemporaryDirectory() as temp:

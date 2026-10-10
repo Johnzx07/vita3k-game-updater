@@ -17,7 +17,7 @@ Get **`vita-pulse.exe`** and **`SHA256SUMS.txt`** from the [latest release](http
 - Shows each release's version, type, and download size.
 - Shows each game's icon/box art in the library list and detail panel, in priority order: locally installed art first, then cached art, then Sony's box art (fetched once and cached). This works for title ID searches too, even when the game is not installed.
 - Downloads all newer packages in version order, including any incremental steps.
-- Verifies every downloaded package against Sony's reported size and SHA-1 before offering it for installation.
+- Verifies every downloaded package against Sony's reported size and SHA-1. A completed package that hashes differently from Sony's metadata is still kept (its SHA-1 can describe an older revision of the same file) and reported as saved-but-unverified, so you can install it; only incomplete or failed downloads are discarded.
 - Keeps packages in `Downloads/Vita3K Game Updates/<TITLE_ID>/` by default.
 
 ## Installing updates

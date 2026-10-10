@@ -32,6 +32,10 @@ TMDB_HMAC_KEY = bytes.fromhex(
 MAX_ICON_BYTES = 8 * 1024 * 1024
 
 
+class IncompleteDownload(Exception):
+    """The download itself did not complete (no data, extra bytes, or network error)."""
+
+
 @dataclass(frozen=True)
 class Game:
     title_id: str
@@ -366,41 +370,96 @@ def verify_package(path: Path, update: Update) -> bool:
     return hmac.compare_digest(digest.hexdigest(), update.sha1)
 
 
+@dataclass(frozen=True)
+class DownloadResult:
+    path: Path
+    verified: bool
+    sha1: str
+    note: str = ""
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def download_update(
     update: Update,
     title_id: str,
     destination: Path,
     progress,
     session: requests.Session | None = None,
-) -> Path:
+    strict: bool = False,
+    attempts: int = 2,
+) -> DownloadResult:
+    """Download one package; a metadata mismatch is a warning, not a deletion.
+
+    Sony's update XML can report a sha1sum (or size) for an older revision of the
+    same .pkg path, so a fully downloaded file can legitimately hash differently.
+    Deleting it would leave the user with nothing to install, so a completed
+    download is kept and reported as unverified. Only a download that did not
+    finish (no data, fewer bytes than Sony served, network error) is discarded.
+    Hashing reads the file back from disk, so no stream/encoding skew can cause a
+    false mismatch. strict=True restores the old raise-on-mismatch behaviour.
+    """
     if not TITLE_ID.fullmatch(title_id):
         raise ValueError("Invalid title ID")
     destination = destination / title_id
     destination.mkdir(parents=True, exist_ok=True)
     path = destination / update.filename
-    if path.exists() and verify_package(path, update):
-        progress(update.size, update.size)
-        return path
-    partial = path.with_suffix(path.suffix + ".part")
+    if path.is_file():
+        on_disk = _hash_file(path)
+        if hmac.compare_digest(on_disk, update.sha1):
+            progress(update.size, update.size)
+            return DownloadResult(path, True, on_disk)
+
     session = session or requests.Session()
-    digest = hashlib.sha1()
-    received = 0
-    try:
-        with session.get(update.url, stream=True, timeout=(10, 60), allow_redirects=False) as response:
-            response.raise_for_status()
-            with partial.open("wb") as stream:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        stream.write(chunk)
-                        digest.update(chunk)
-                        received += len(chunk)
-                        if received > update.size:
-                            raise ValueError("Package exceeded the size in Sony metadata")
-                        progress(received, update.size)
-        if received != update.size or not hmac.compare_digest(digest.hexdigest(), update.sha1):
-            raise ValueError("Package size or SHA-1 did not match Sony metadata")
+    partial = path.with_suffix(path.suffix + ".part")
+    attempts = max(1, attempts)
+    for attempt in range(attempts):
+        received = 0
+        served = None
+        try:
+            with session.get(update.url, stream=True, timeout=(10, 60), allow_redirects=False) as response:
+                response.raise_for_status()
+                header = response.headers.get("Content-Length")
+                served = int(header) if header and header.isdigit() else None
+                with partial.open("wb") as stream:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            stream.write(chunk)
+                            received += len(chunk)
+                            if received > update.size:
+                                raise IncompleteDownload("Package exceeded the size in Sony metadata")
+                            progress(received, update.size)
+            if received == 0:
+                raise IncompleteDownload("Package download returned no data")
+            if received != update.size and served != received:
+                raise IncompleteDownload(
+                    f"Package incomplete: {received} of {update.size} bytes received"
+                )
+            sha1 = _hash_file(partial)
+            size_ok = received == update.size
+            sha_ok = hmac.compare_digest(sha1, update.sha1)
+            note = "" if (size_ok and sha_ok) else (
+                f"SHA-1 did not match Sony metadata (file hashes {sha1[:12]}…)"
+                if not sha_ok else
+                f"size differs from metadata ({received} vs {update.size} bytes)"
+            )
+            if size_ok and sha_ok:
+                partial.replace(path)
+                return DownloadResult(path, True, sha1)
+        except (requests.RequestException, OSError, IncompleteDownload):
+            partial.unlink(missing_ok=True)
+            raise
+        if attempt + 1 < attempts:
+            continue  # one retry before trusting a mismatch
+        if strict:
+            partial.unlink(missing_ok=True)
+            raise ValueError("Package SHA-1 did not match Sony metadata")
         partial.replace(path)
-        return path
-    except Exception:
-        partial.unlink(missing_ok=True)
-        raise
+        return DownloadResult(path, False, sha1, note)
+    raise ValueError("Package download failed")
