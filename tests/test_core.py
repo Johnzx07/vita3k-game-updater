@@ -1,9 +1,38 @@
 import hashlib
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 
-from vita_updater.core import Update, parse_updates, pending_updates, update_url, verify_package
+from vita_updater.core import (
+    Update,
+    find_library_root,
+    parse_updates,
+    pending_updates,
+    read_sfo,
+    update_url,
+    verify_package,
+)
+
+
+def build_sfo(entries, layout):
+    """entries: list of (key, format, value_bytes); layout: 'canonical' or 'vita'."""
+    key_block = b"".join(k.encode() + b"\x00" for k, _, _ in entries)
+    data_block = b"".join(v + b"\x00" for _, _, v in entries)
+    header = b"\x00PSF" + struct.pack(
+        "<4I", 257, 20 + 16 * len(entries),
+        20 + 16 * len(entries) + len(key_block), len(entries),
+    )
+    index = b""
+    ko = do = 0
+    for k, fmt, v in entries:
+        if layout == "canonical":
+            index += struct.pack("<4I", ko, fmt, do, len(v))
+        else:  # vita: nameoff/format as uint16 + size, maximum, dataoff
+            index += struct.pack("<HHIII", ko, fmt, len(v), 0, do)
+        ko += len(k) + 1
+        do += len(v) + 1
+    return header + index + key_block + data_block
 
 
 class CoreTests(unittest.TestCase):
@@ -34,6 +63,64 @@ class CoreTests(unittest.TestCase):
         url="https://example.com/ppkg/np/PCSA00007/update.pkg"/></tag></titlepatch>'''
         with self.assertRaises(ValueError):
             parse_updates(xml, "PCSA00007")
+
+    def test_read_sfo_canonical_layout(self):
+        entries = [("name", 516, b"PCSA00007"), ("title", 516, b"Example Game"), ("app_ver", 4, b"\x01\x00\x00\x00")]
+        raw = build_sfo(entries, "canonical")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "canonical.sfo"
+            path.write_bytes(raw)
+            result = read_sfo(path)
+            self.assertEqual(result["name"], "PCSA00007")
+            self.assertEqual(result["title"], "Example Game")
+            self.assertNotIn("app_ver", result)  # integer formats are skipped
+
+    def test_read_sfo_vita_layout(self):
+        entries = [("name", 516, b"PCSA00007"), ("title", 516, b"Example Game")]
+        raw = build_sfo(entries, "vita")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "vita.sfo"
+            path.write_bytes(raw)
+            result = read_sfo(path)
+            self.assertEqual(result["name"], "PCSA00007")
+            self.assertEqual(result["title"], "Example Game")
+
+    def test_read_sfo_rejects_nonstandard_entry_size(self):
+        raw = build_sfo([("name", 516, b"PCSA00007")], "canonical")
+        broken = bytearray(raw)
+        broken[8:12] = (20 + 20).to_bytes(4, "little")  # header claims 20-byte entries
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bad.sfo"
+            path.write_bytes(bytes(broken))
+            with self.assertRaises(ValueError):
+                read_sfo(path)
+
+    def test_read_sfo_real_vita3k_file(self):
+        raw = build_sfo(
+            [
+                ("name", 516, b"NPXS10000"),
+                ("title", 516, b"near"),
+                ("app_ver", 516, b"01.00"),
+            ],
+            "vita",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "param.sfo"
+            path.write_bytes(raw)
+            result = read_sfo(path)
+            self.assertEqual(result["name"], "NPXS10000")
+            self.assertEqual(result["app_ver"], "01.00")
+
+    def test_find_library_root_accepts_parent_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "Vita3K" / "Vita3K"
+            (root / "ux0" / "app").mkdir(parents=True)
+            self.assertEqual(find_library_root(temp_path / "Vita3K"), root)
+            self.assertEqual(find_library_root(root), root)
+            fs_root = temp_path / "other"
+            (fs_root / "fs" / "ux0" / "app").mkdir(parents=True)
+            self.assertEqual(find_library_root(fs_root), fs_root / "fs")
 
     def test_sha1_and_size_verification(self):
         with tempfile.TemporaryDirectory() as temp:

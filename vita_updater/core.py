@@ -52,30 +52,60 @@ def version_key(value: str) -> tuple[int, ...]:
         return (0,)
 
 
+SFO_FORMATS = {2, 4, 6, 516}
+SFO_STRING_FORMAT = 516
+
+
+def _sfo_entry_fields(raw: bytes, offset: int, layout: str) -> tuple[int, int, int, int]:
+    """Return (nameoff, format, size, dataoff) for one 16-byte index entry.
+
+    Field order differs in real files: the canonical order is
+    (nameoff, format, dataoff, size) as uint32s; the Vita/SFOEditor variant
+    packs nameoff/format as two uint16s followed by size, maximum, dataoff.
+    """
+    a, b, c, d = struct.unpack_from("<4I", raw, offset)
+    if layout == "canonical":
+        return a, b, d, c
+    return a & 0xFFFF, a >> 16, b, d
+
+
 def read_sfo(path: Path) -> dict[str, str]:
     """Read the small subset of PARAM.SFO needed by the library view."""
     raw = path.read_bytes()
     if len(raw) < 20 or raw[:4] != b"\x00PSF":
         raise ValueError("Invalid PARAM.SFO header")
     _, key_start, data_start, count = struct.unpack_from("<4I", raw, 4)
-    if count > 1024 or 20 + count * 16 > len(raw):
+    if count == 0 or count > 1024:
         raise ValueError("Invalid PARAM.SFO index")
+    entry_size = key_start - 20
+    if entry_size != 16 * count or 20 + entry_size > len(raw):
+        raise ValueError("Invalid PARAM.SFO index")
+    key_size = data_start - key_start
+    data_size = len(raw) - data_start
+
+    def valid(fields: tuple[int, int, int, int]) -> bool:
+        nameoff, fmt, size, dataoff = fields
+        return nameoff < key_size and fmt in SFO_FORMATS and dataoff + size <= data_size
+
+    first = _sfo_entry_fields(raw, 20, "canonical")
+    layout = "canonical" if valid(first) else "vita"
+    if not valid(_sfo_entry_fields(raw, 20, layout)):
+        raise ValueError("Invalid PARAM.SFO index")
+
     result: dict[str, str] = {}
     for index in range(count):
-        key_offset, _format, length, _maximum, data_offset = struct.unpack_from(
-            "<HHIII", raw, 20 + index * 16
-        )
-        k0 = key_start + key_offset
-        d0 = data_start + data_offset
-        if k0 >= len(raw) or d0 + length > len(raw):
+        nameoff, fmt, size, dataoff = _sfo_entry_fields(raw, 20 + index * 16, layout)
+        if not valid((nameoff, fmt, size, dataoff)):
             continue
+        k0 = key_start + nameoff
         k1 = raw.find(b"\x00", k0, min(len(raw), k0 + 128))
         if k1 < 0:
             continue
         key = raw[k0:k1].decode("utf-8", errors="replace")
-        value = raw[d0:d0 + length].split(b"\x00", 1)[0].decode(
-            "utf-8", errors="replace"
-        )
+        d0 = data_start + dataoff
+        if fmt != SFO_STRING_FORMAT:
+            continue
+        value = raw[d0:d0 + size].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
         result[key] = value.strip()
     return result
 
@@ -86,7 +116,13 @@ def find_library_root(chosen: Path | None = None) -> Path | None:
     for candidate in candidates:
         if candidate is None:
             continue
-        for root in (candidate, candidate / "fs"):
+        seen = set()
+        # Walk the chosen folder and one level up so users can pick either the
+        # content folder (Vita3K/Vita3K), its fs subfolder, or the parent Vita3K.
+        for root in (candidate, candidate / "fs", candidate / "Vita3K", candidate.parent):
+            if root in seen:
+                continue
+            seen.add(root)
             if (root / "ux0" / "app").is_dir():
                 return root
     return None
