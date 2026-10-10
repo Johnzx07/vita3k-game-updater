@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import os
 import re
 import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -20,6 +21,15 @@ SONY_HOST = "gs2-sec.ww.prod.dl.playstation.net"
 HMAC_KEY = bytes.fromhex(
     "e5e278aa1ee34082a088279c83f9bbc806821c52f2ab5d2b4abd995450355114"
 )
+# Sony's public TMDB key (same one the PS3/RPCS3 updater uses). It serves PS3
+# titles; Vita IDs return 404/403 there, so remote art is an enhancement that
+# degrades to nothing instead of breaking the core lookup.
+TMDB_URL = "https://tmdb.np.dl.playstation.net/tmdb/{pid}_{hash}/{pid}.xml"
+TMDB_HMAC_KEY = bytes.fromhex(
+    "F5DE66D2680E255B2DF79E74F890EBF349262F618BCAE2A9ACCDEE5156CE8DF2"
+    "CDF2D48C71173CDC2594465B87405D197CF1AED3B7E9671EEB56CA6753C2E6B0"
+)
+MAX_ICON_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -108,6 +118,119 @@ def read_sfo(path: Path) -> dict[str, str]:
         value = raw[d0:d0 + size].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
         result[key] = value.strip()
     return result
+
+
+def valid_icon_bytes(data: bytes | None) -> bool:
+    """True when the bytes decode as a real image within the sanity cap."""
+    if not data or len(data) > MAX_ICON_BYTES:
+        return False
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        return True
+    except Exception:
+        return False
+
+
+def art_cache_dir() -> Path:
+    return Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / "Vita Pulse" / "art_cache"
+
+
+def _tmdb_hash(pid: str) -> str:
+    return hmac.new(TMDB_HMAC_KEY, pid.encode(), hashlib.sha1).hexdigest().upper()
+
+
+def fetch_meta(title_id: str, session: requests.Session | None = None) -> tuple[str, str]:
+    """Display name + box-art URL from Sony's TMDB; never raises.
+
+    TMDB serves PS3 product ids with this key. Vita ids usually 404 there, so
+    metadata is an enhancement that degrades to empty values instead of
+    breaking the update lookup.
+    """
+    title_id = title_id.upper().strip()
+    if not TITLE_ID.fullmatch(title_id):
+        return "", ""
+    pid = f"{title_id}_00"
+    url = TMDB_URL.format(pid=pid, hash=_tmdb_hash(pid))
+    try:
+        response = (session or requests.Session()).get(url, timeout=(10, 20))
+        if response.status_code != 200 or not response.content:
+            return "", ""
+        root = ET.fromstring(response.content)
+    except Exception:
+        return "", ""
+    name = (root.findtext("name") or "").strip()
+    icon_url = (root.findtext("icon") or "").strip()
+    return " ".join(name.split()), icon_url
+
+
+ICON_HOSTS = {"tmdb.np.dl.playstation.net", "store.playstation.com", "store.np.playstation.net"}
+
+
+def _safe_icon_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in ICON_HOSTS or not host.endswith("playstation.net"):
+        return ""
+    return urlunparse(parsed)
+
+
+def download_icon(url: str, session: requests.Session | None = None) -> bytes | None:
+    """Fetch box-art bytes for a Sony icon URL; never raises."""
+    url = _safe_icon_url(url)
+    if not url:
+        return None
+    try:
+        response = (session or requests.Session()).get(url, timeout=(10, 20))
+        if response.status_code != 200:
+            return None
+    except Exception:
+        return None
+    return response.content if valid_icon_bytes(response.content) else None
+
+
+def find_game_art(
+    root: Path,
+    title_id: str,
+    session: requests.Session | None = None,
+    cache_dir: Path | None = None,
+    allow_remote: bool = True,
+) -> Path | None:
+    """Path to a title's art, in priority order (same design as the RPCS3 updater).
+
+    1. locally installed art (ux0/app/<id>/sce_sys/icon0.png, patch copy)
+    2. already-cached art in the Vita Pulse cache folder
+    3. Sony TMDB box art (network) — only when nothing local or cached exists,
+       then stored in the cache for the next run.
+
+    Never raises: art is an enhancement, not a requirement for the update check.
+    """
+    title_id = title_id.upper().strip()
+    if not TITLE_ID.fullmatch(title_id):
+        return None
+    if root is not None:
+        for folder in (root / "ux0" / "app" / title_id / "sce_sys", root / "ux0" / "patch" / title_id / "sce_sys"):
+            icon = folder / "icon0.png"
+            if icon.is_file() and valid_icon_bytes(icon.read_bytes()):
+                return icon
+    cache = cache_dir or art_cache_dir()
+    cached = cache / f"{title_id}.png"
+    if cached.is_file() and valid_icon_bytes(cached.read_bytes()):
+        return cached
+    if not allow_remote:
+        return None
+    _, icon_url = fetch_meta(title_id, session)
+    data = download_icon(icon_url, session)
+    if not data:
+        return None
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(data)
+    except OSError:
+        return None
+    return cached
 
 
 def find_library_root(chosen: Path | None = None) -> Path | None:

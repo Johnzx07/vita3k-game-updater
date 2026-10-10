@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+import requests
 from PySide6.QtCore import QObject, QThread, Qt, Signal, QSize, QSettings
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
@@ -12,7 +13,10 @@ from PySide6.QtWidgets import (
     QFileDialog, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from .core import TITLE_ID, Game, Update, download_update, fetch_updates, find_library_root, pending_updates, scan_library
+from .core import (
+    TITLE_ID, Game, Update, art_cache_dir, download_update, fetch_updates,
+    find_game_art, find_library_root, pending_updates, scan_library,
+)
 
 
 def resource(name: str) -> Path:
@@ -28,24 +32,37 @@ class Worker(QObject):
     downloaded = Signal(str, str)
     progress = Signal(str, int, int)
     error = Signal(str, str)
+    art_ready = Signal(str, object)
     finished = Signal()
 
     def __init__(self, mode: str, games: list[Game] | None = None, updates: list[Update] | None = None,
-                 title_id: str = "", destination: Path | None = None):
+                 title_id: str = "", destination: Path | None = None,
+                 root: Path | None = None, cache_dir: Path | None = None):
         super().__init__()
         self.mode = mode
         self.games = games or []
         self.updates = updates or []
         self.title_id = title_id
         self.destination = destination
+        self.root = root
+        self.cache_dir = cache_dir or art_cache_dir()
+        self.session = requests.Session()
 
     def run(self):
         try:
             if self.mode == "check":
                 for game in self.games:
                     try:
-                        title, updates = fetch_updates(game.title_id)
+                        title, updates = fetch_updates(game.title_id, self.session)
                         self.checked.emit(game.title_id, title, updates)
+                        # Art priority mirrors the RPCS3 updater: local art first,
+                        # cached art second; Sony box art is fetched only when the
+                        # title has no local or cached copy and updates exist to show.
+                        art = find_game_art(self.root, game.title_id, self.session, self.cache_dir, allow_remote=False)
+                        if art is None and updates:
+                            art = find_game_art(self.root, game.title_id, self.session, self.cache_dir, allow_remote=True)
+                        if art:
+                            self.art_ready.emit(game.title_id, art)
                     except Exception as exc:
                         self.error.emit(game.title_id, str(exc))
             elif self.mode == "download" and self.destination:
@@ -76,6 +93,7 @@ class MainWindow(QMainWindow):
         self.download_dir = Path(self.settings.value("download_dir", str(Path.home() / "Downloads" / "Vita3K Game Updates")))
         self.games: list[Game] = []
         self.available: dict[str, list[Update]] = {}
+        self.art: dict[str, Path] = {}
         self.selected_id: str | None = None
         self.busy = False
         self.current_mode = ""
@@ -278,11 +296,15 @@ class MainWindow(QMainWindow):
     def reload_library(self):
         self.available.clear()
         self.games = []
+        self.art = {}
         if self.root:
             try:
                 self.games = scan_library(self.root)
                 self.path_label.setText(str(self.root))
                 self.hero_subtitle.setText(f"{len(self.games)} installed titles found. Check Sony's update feed to see what is ready.")
+                for game in self.games:
+                    if game.icon_path:
+                        self.art[game.title_id] = game.icon_path
             except Exception as exc:
                 QMessageBox.warning(self, "Library scan failed", str(exc))
         else:
@@ -307,14 +329,30 @@ class MainWindow(QMainWindow):
             card = QWidget()
             card.setStyleSheet("background: transparent;")
             card.setAttribute(Qt.WA_TransparentForMouseEvents)
-            stack = QVBoxLayout(card)
-            stack.setContentsMargins(10, 6, 10, 6)
+            row = QHBoxLayout(card)
+            row.setContentsMargins(10, 6, 10, 6)
+            row.setSpacing(11)
+            art = game.icon_path or self.art.get(game.title_id)
+            thumb = QLabel()
+            thumb.setFixedSize(48, 48)
+            if art and art.is_file():
+                pixmap = QPixmap(str(art))
+                if not pixmap.isNull():
+                    thumb.setPixmap(pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                thumb.setToolTip(f"{game.title_id} game art")
+            else:
+                thumb.setPixmap(QIcon(str(resource("vita-pulse.png"))).pixmap(QSize(48, 48)))
+                thumb.setToolTip("No game art found — local, cache, or Sony")
+            row.addWidget(thumb)
+            stack = QVBoxLayout()
+            stack.setContentsMargins(0, 0, 0, 0)
             stack.setSpacing(2)
             name = self._label(game.title, "listTitle")
             name.setToolTip(game.title)
             meta = self._label(f"{game.title_id}  ·  v{game.installed_version}{suffix}", "listMeta")
             stack.addWidget(name)
             stack.addWidget(meta)
+            row.addLayout(stack, 1)
             self.game_list.setItemWidget(item, card)
             if game.title_id == keep:
                 self.game_list.setCurrentItem(item)
@@ -350,7 +388,8 @@ class MainWindow(QMainWindow):
         self.detail_icon.show()
         self.download_button.show()
         self.open_folder_button.show()
-        icon = QPixmap(str(game.icon_path)) if game.icon_path else QPixmap()
+        art = (game.icon_path or self.art.get(game.title_id)) if game else None
+        icon = QPixmap(str(art)) if art and Path(art).is_file() else QPixmap()
         if icon.isNull():
             icon = QIcon(str(resource("vita-pulse.png"))).pixmap(QSize(72, 72))
         self.detail_icon.setPixmap(icon.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -392,7 +431,7 @@ class MainWindow(QMainWindow):
         self.populate_list()
         if not self.busy:
             self.activity.setText(f"Checking {title_id}…")
-            self._start_worker(Worker("check", games=[game]))
+            self._start_worker(Worker("check", games=[game], root=self.root))
 
     def _start_worker(self, worker: Worker):
         self.busy = True
@@ -404,6 +443,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.checked.connect(self._on_checked)
         worker.downloaded.connect(self._on_downloaded)
+        worker.art_ready.connect(self._on_art)
         worker.progress.connect(self._on_progress)
         worker.error.connect(self._on_error)
         worker.finished.connect(thread.quit)
@@ -422,12 +462,28 @@ class MainWindow(QMainWindow):
         self.activity.setText(f"Checking {len(self.games)} titles…")
         self.check_errors = 0
         self.progress_bar.hide()
-        self._start_worker(Worker("check", games=self.games))
+        self._start_worker(Worker("check", games=self.games, root=self.root))
 
     def _on_checked(self, title_id: str, title: str, updates: list[Update]):
         self.available[title_id] = updates
         self.activity.setText(f"Checked {title_id} • {len(updates)} releases")
         self.populate_list()
+
+    def _on_art(self, title_id: str, path):
+        art = Path(path)
+        if not art.is_file():
+            return
+        self.art[title_id] = art
+        game = next((g for g in self.games if g.title_id == title_id), None)
+        if game and game.icon_path is None:
+            self.games = [
+                Game(g.title_id, g.title, g.installed_version, art if g.title_id == title_id else g.icon_path)
+                for g in self.games
+            ]
+        if title_id == self.selected_id:
+            self.refresh_detail()
+        else:
+            self.populate_list()
 
     def _on_downloaded(self, title_id: str, path: str):
         self.activity.setText(f"Verified {Path(path).name}")

@@ -15,6 +15,7 @@ Get **`vita-pulse.exe`** and **`SHA256SUMS.txt`** from the [latest release](http
 - Finds installed games from Vita3K's `ux0/app` content folder and reads titles, versions, and icons from `param.sfo`.
 - Compares the installed base or patch version with official update metadata. You can also look up an exact title ID.
 - Shows each release's version, type, and download size.
+- Shows each game's icon/box art in the library list and detail panel, in priority order: locally installed art first, then cached art, then Sony's box art (fetched once and cached). This works for title ID searches too, even when the game is not installed.
 - Downloads all newer packages in version order, including any incremental steps.
 - Verifies every downloaded package against Sony's reported size and SHA-1 before offering it for installation.
 - Keeps packages in `Downloads/Vita3K Game Updates/<TITLE_ID>/` by default.

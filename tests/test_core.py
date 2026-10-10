@@ -1,18 +1,30 @@
 import hashlib
+import io
 import struct
 import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
+
 from vita_updater.core import (
     Update,
+    _safe_icon_url,
+    find_game_art,
     find_library_root,
     parse_updates,
     pending_updates,
     read_sfo,
     update_url,
+    valid_icon_bytes,
     verify_package,
 )
+
+
+def png_bytes(size: int = 8) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGBA", (size, size), (10, 20, 30, 255)).save(buffer, "PNG")
+    return buffer.getvalue()
 
 
 def build_sfo(entries, layout):
@@ -121,6 +133,55 @@ class CoreTests(unittest.TestCase):
             fs_root = temp_path / "other"
             (fs_root / "fs" / "ux0" / "app").mkdir(parents=True)
             self.assertEqual(find_library_root(fs_root), fs_root / "fs")
+
+    def test_valid_icon_bytes(self):
+        self.assertTrue(valid_icon_bytes(png_bytes()))
+        self.assertFalse(valid_icon_bytes(b"not an image"))
+        self.assertFalse(valid_icon_bytes(b""))
+        self.assertFalse(valid_icon_bytes(png_bytes() + b"x" * (9 * 1024 * 1024)))
+
+    def test_safe_icon_url(self):
+        self.assertEqual(_safe_icon_url("https://tmdb.np.dl.playstation.net/x/y.png"),
+                         "https://tmdb.np.dl.playstation.net/x/y.png")
+        self.assertEqual(_safe_icon_url("http://evil.example/x.png"), "")
+        self.assertEqual(_safe_icon_url("https://evil.playstation.net.example/x.png"), "")
+        self.assertEqual(_safe_icon_url(""), "")
+
+    def test_find_game_art_prefers_local_then_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "root"
+            local = root / "ux0" / "app" / "PCSA00007" / "sce_sys"
+            local.mkdir(parents=True)
+            (local / "icon0.png").write_bytes(png_bytes())
+            cache = temp_path / "cache"
+            cache.mkdir()
+            (cache / "PCSA00007.png").write_bytes(png_bytes(4))
+            (cache / "PCSA00008.png").write_bytes(png_bytes(4))
+            # local beats cache when both exist
+            self.assertEqual(find_game_art(root, "PCSA00007", cache_dir=cache, allow_remote=False), local / "icon0.png")
+            # no local art falls back to cache without network
+            other = root / "ux0" / "app" / "PCSA00008" / "sce_sys"
+            other.mkdir(parents=True)
+            cache_art = find_game_art(root, "PCSA00008", cache_dir=cache, allow_remote=False)
+            self.assertEqual(cache_art, cache / "PCSA00008.png")
+            # cache-only lookup with no cache and no network returns None, never raises
+            self.assertIsNone(find_game_art(root, "PCSA00009", cache_dir=cache, allow_remote=False))
+
+    def test_find_game_art_without_library_root_uses_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp) / "cache"
+            cache.mkdir()
+            (cache / "PCSA00007.png").write_bytes(png_bytes())
+            self.assertEqual(find_game_art(None, "PCSA00007", cache_dir=cache, allow_remote=False), cache / "PCSA00007.png")
+            self.assertIsNone(find_game_art(None, "BADID", cache_dir=cache, allow_remote=False))
+
+    def test_find_game_art_rejects_corrupt_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp) / "cache"
+            cache.mkdir()
+            (cache / "PCSA00007.png").write_bytes(b"corrupted")
+            self.assertIsNone(find_game_art(None, "PCSA00007", cache_dir=cache, allow_remote=False))
 
     def test_sha1_and_size_verification(self):
         with tempfile.TemporaryDirectory() as temp:
